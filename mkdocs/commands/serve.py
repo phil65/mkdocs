@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import logging
+import pathlib
 import shutil
 import tempfile
-from os.path import isdir, isfile, join
+
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -14,10 +16,28 @@ from mkdocs.config import load_config
 from mkdocs.exceptions import Abort
 from mkdocs.livereload import LiveReloadServer
 
+
 if TYPE_CHECKING:
     from mkdocs.config.defaults import MkDocsConfig
 
 log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def catch_exceptions(config, site_dir):
+    try:
+        yield
+    except jinja2.exceptions.TemplateError:
+        # This is a subclass of OSError, but shouldn't be suppressed.
+        raise
+    except OSError as e:  # pragma: no cover
+        # Avoid ugly, unhelpful traceback
+        msg = f"{type(e).__name__}: {e}"
+        raise Abort(msg) from e
+    finally:
+        config.plugins.on_shutdown()
+        if pathlib.Path(site_dir).is_dir():
+            shutil.rmtree(site_dir)
 
 
 def serve(
@@ -58,62 +78,61 @@ def serve(
 
     config = get_config()
     config.plugins.on_startup(command=('build' if is_clean else 'serve'), dirty=is_dirty)
+    host, port = config.dev_addr
+
+    suffix = ("/" + mount_path(config).lstrip("/")).rstrip("/") + "/"
+    live_server_url = f"http://{host}:{port}{suffix}"
 
     def builder(config: MkDocsConfig | None = None):
         log.info("Building documentation...")
         if config is None:
             config = get_config()
 
-        build(config, live_server=None if is_clean else server, dirty=is_dirty)
+        build(config, live_server_url=live_server_url, dirty=is_dirty)
 
-    host, port = config.dev_addr
+    # Perform the initial build
+    with catch_exceptions(config, site_dir):
+        builder(config)
+
     server = LiveReloadServer(
         builder=builder, host=host, port=port, root=site_dir, mount_path=mount_path(config)
     )
-
     def error_handler(code) -> bytes | None:
-        if code in (404, 500):
-            error_page = join(site_dir, f'{code}.html')
-            if isfile(error_page):
-                with open(error_page, 'rb') as f:
-                    return f.read()
-        return None
+        if code not in (404, 500):
+            return None
+        error_page = pathlib.Path(site_dir) / f"{code}.html"
+        if not error_page.is_file():
+            return None
+        with error_page.open("rb") as f:
+            return f.read()
 
+    # Run the server
     server.error_handler = error_handler
+    with catch_exceptions(config, site_dir):
+        run_server(server, config, builder, livereload, watch_theme)
+
+
+def run_server(server, config, builder, livereload, watch_theme):
+    if livereload:
+        # Watch the documentation files, the config file and the theme files.
+        server.watch(config.docs_dir)
+        if config.config_file_path:
+            server.watch(config.config_file_path)
+
+        if watch_theme:
+            for d in config.theme.dirs:
+                server.watch(d)
+
+        # Run `serve` plugin events.
+        server = config.plugins.on_serve(server, config=config, builder=builder)
+
+        for item in config.watch:
+            server.watch(item)
 
     try:
-        # Perform the initial build
-        builder(config)
-
-        if livereload:
-            # Watch the documentation files, the config file and the theme files.
-            server.watch(config.docs_dir)
-            if config.config_file_path:
-                server.watch(config.config_file_path)
-
-            if watch_theme:
-                for d in config.theme.dirs:
-                    server.watch(d)
-
-            # Run `serve` plugin events.
-            server = config.plugins.on_serve(server, config=config, builder=builder)
-
-            for item in config.watch:
-                server.watch(item)
-
-        try:
-            server.serve()
-        except KeyboardInterrupt:
-            log.info("Shutting down...")
-        finally:
-            server.shutdown()
-    except jinja2.exceptions.TemplateError:
-        # This is a subclass of OSError, but shouldn't be suppressed.
-        raise
-    except OSError as e:  # pragma: no cover
-        # Avoid ugly, unhelpful traceback
-        raise Abort(f'{type(e).__name__}: {e}')
+        server.serve()
+    except KeyboardInterrupt:
+        log.info("Shutting down...")
     finally:
-        config.plugins.on_shutdown()
-        if isdir(site_dir):
-            shutil.rmtree(site_dir)
+        server.shutdown()
+
